@@ -2,10 +2,12 @@
 """DeltaTest - CI Test Impact Analysis Engine. Only run affected tests."""
 import ast
 import os
+import sys
 import subprocess
 import json
+import argparse
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, deque
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".mypy_cache"}
 
@@ -52,95 +54,181 @@ def _py_files(root):
     return [p for p in rp.rglob("*.py") if not SKIP_DIRS.intersection(p.relative_to(rp).parts)]
 
 
+def _path_to_module(filepath, root):
+    """Convert a file path to a dotted module name."""
+    try:
+        rel = Path(filepath).resolve().relative_to(Path(root).resolve())
+    except ValueError:
+        return None
+    parts = list(rel.parts)
+    if not parts:
+        return None
+    if parts[-1] == "__init__.py":
+        parts = parts[:-1]
+    else:
+        parts[-1] = parts[-1].replace(".py", "")
+    return ".".join(parts) if parts else None
+
+
 def build_dependency_graph(root="."):
-    """Build reverse dependency graph: source_file -> {files that import it}."""
-    rp = Path(root).resolve()
+    """Build reverse dependency graph: file -> set of files that import it.
+
+    Returns (reverse_deps, mod_map) where mod_map maps dotted module names
+    to their relative file paths.
+    """
     files = _py_files(root)
-    mod_map = {}
-    for fp in files:
-        parts = list(fp.relative_to(rp).parts)
-        if parts[-1] == "__init__.py":
-            mod = ".".join(parts[:-1])
-        else:
-            mod = ".".join(parts)[:-3]  # strip .py
+    root_resolved = Path(root).resolve()
+
+    mod_to_file = {}
+    for f in files:
+        mod = _path_to_module(f, root)
         if mod:
-            mod_map[mod] = str(fp.relative_to(rp))
+            rel = str(f.relative_to(root_resolved))
+            mod_to_file[mod] = rel
+
     reverse = defaultdict(set)
-    for fp in files:
-        rel = str(fp.relative_to(rp))
-        for imp in extract_imports(str(fp)):
-            candidate = imp
-            while candidate:
-                if candidate in mod_map:
-                    reverse[mod_map[candidate]].add(rel)
-                    break
-                candidate = candidate.rsplit(".", 1)[0] if "." in candidate else ""
-    return dict(reverse), mod_map
+    for f in files:
+        rel = str(f.relative_to(root_resolved))
+        imports = extract_imports(str(f))
+        for imp in imports:
+            for mod_name, mod_file in mod_to_file.items():
+                if imp == mod_name or imp.startswith(mod_name + ".") or mod_name.startswith(imp + "."):
+                    if mod_file != rel:
+                        reverse[mod_file].add(rel)
+
+    return dict(reverse), mod_to_file
 
 
-def find_affected_tests(changed_files, reverse_deps):
-    """BFS through reverse deps to find all test files affected by changes."""
+def find_affected_tests(changed_files, reverse_deps, mod_map, root="."):
+    """BFS through reverse deps to find all affected test files."""
     affected = set()
     visited = set()
-    queue = list(changed_files)
+    queue = deque(changed_files)
+
     while queue:
-        current = queue.pop(0)
+        current = queue.popleft()
         if current in visited:
             continue
         visited.add(current)
+
         if _is_test(current):
             affected.add(current)
-        for dep in reverse_deps.get(current, []):
-            if dep not in visited:
-                queue.append(dep)
+
+        for dep_file in reverse_deps.get(current, set()):
+            if dep_file not in visited:
+                queue.append(dep_file)
+
     return sorted(affected)
 
 
-def analyze(base="main", root="."):
-    """Full analysis pipeline: git diff -> dep graph -> affected tests."""
-    rp = Path(root).resolve()
-    changed = get_changed_files(base, str(rp))
-    rev, _ = build_dependency_graph(str(rp))
-    all_tests = sorted(str(p.relative_to(rp)) for p in _py_files(str(rp)) if _is_test(p.name))
-    affected = find_affected_tests(changed, rev)
-    total, selected = len(all_tests), len(affected)
-    pct = round((total - selected) / total * 100, 1) if total else 0.0
-    return {
-        "changed_files": changed, "total_tests": total,
-        "selected_tests": selected, "skipped_tests": total - selected,
-        "skip_percentage": pct, "affected_test_files": affected,
-        "skipped_test_files": [t for t in all_tests if t not in set(affected)],
+def _all_test_files(root):
+    """Return relative paths of all test files under root."""
+    root_resolved = Path(root).resolve()
+    return sorted(
+        str(f.relative_to(root_resolved))
+        for f in _py_files(root)
+        if _is_test(str(f))
+    )
+
+
+def format_output_json(changed_files, affected_tests, all_test_files):
+    """Format analysis results as JSON.
+
+    Output schema:
+        changed_files: list[str]
+        affected_tests: list[str]
+        skipped_tests: list[str]
+        reduction_percent: float
+    """
+    skipped = sorted(set(all_test_files) - set(affected_tests))
+    total = len(all_test_files)
+    reduction = round(((total - len(affected_tests)) / total * 100) if total > 0 else 0, 1)
+    return json.dumps({
+        "changed_files": changed_files,
+        "affected_tests": affected_tests,
+        "skipped_tests": skipped,
+        "reduction_percent": reduction,
+    }, indent=2)
+
+
+def format_output_sarif(changed_files, affected_tests, all_test_files):
+    """Format analysis results as SARIF 2.1.0."""
+    results = []
+    for t in affected_tests:
+        results.append({
+            "ruleId": "deltatest/affected-test",
+            "level": "note",
+            "message": {"text": f"Test file {t} is affected by changes"},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": t}
+                }
+            }],
+        })
+
+    sarif = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "DeltaTest",
+                    "version": "0.1.0",
+                    "informationUri": "https://github.com/deltatest/deltatest",
+                    "rules": [{
+                        "id": "deltatest/affected-test",
+                        "shortDescription": {"text": "Test affected by code changes"},
+                    }],
+                }
+            },
+            "results": results,
+        }],
     }
+    return json.dumps(sarif, indent=2)
 
 
-def main():
-    import argparse
-    p = argparse.ArgumentParser(description="DeltaTest - CI Test Impact Analysis")
-    p.add_argument("--base", default="main", help="Base branch (default: main)")
-    p.add_argument("--root", default=".", help="Project root directory")
-    p.add_argument("--json", action="store_true", help="JSON output")
-    p.add_argument("--pytest-args", action="store_true", help="Pytest-compatible file list")
-    args = p.parse_args()
-    result = analyze(args.base, args.root)
-    if args.pytest_args:
-        print(" ".join(result["affected_test_files"]))
-    elif args.json:
-        print(json.dumps(result, indent=2))
+def main(argv=None):
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(
+        prog="deltatest",
+        description="DeltaTest — CI Test Impact Analysis Engine",
+    )
+    parser.add_argument("--base", default="main", help="Base branch to diff against (default: main)")
+    parser.add_argument("--root", default=".", help="Project root directory (default: .)")
+    parser.add_argument("--pytest-args", action="store_true", help="Output affected tests as pytest arguments")
+    parser.add_argument(
+        "--output-format",
+        choices=["text", "json", "sarif"],
+        default="text",
+        help="Output format: text (default), json, or sarif",
+    )
+    args = parser.parse_args(argv)
+
+    root = os.path.abspath(args.root)
+    changed = get_changed_files(args.base, root)
+    reverse_deps, mod_map = build_dependency_graph(root)
+    affected = find_affected_tests(changed, reverse_deps, mod_map, root)
+    all_tests = _all_test_files(root)
+
+    if args.output_format == "json":
+        print(format_output_json(changed, affected, all_tests))
+    elif args.output_format == "sarif":
+        print(format_output_sarif(changed, affected, all_tests))
+    elif args.pytest_args:
+        print(" ".join(affected))
     else:
-        print(f"\U0001f52c DeltaTest Impact Analysis\n{'=' * 42}")
-        print(f"Changed:  {len(result['changed_files'])} files")
-        print(f"Tests:    {result['selected_tests']}/{result['total_tests']} selected")
-        print(f"Skipped:  {result['skipped_tests']} ({result['skip_percentage']}%)")
-        if result["affected_test_files"]:
-            print("\nRun these tests:")
-            for t in result["affected_test_files"]:
-                print(f"  \u2705 {t}")
-        if result["skipped_test_files"]:
-            print("\nSafely skipped:")
-            for t in result["skipped_test_files"]:
-                print(f"  \u23ed\ufe0f  {t}")
-        est = result["skipped_tests"] * 0.5 * 20 * 22
-        print(f"\n\U0001f4b0 Est. monthly CI savings: ~{int(est)} minutes")
+        total = len(all_tests)
+        skipped = total - len(affected)
+        reduction = round((skipped / total * 100) if total > 0 else 0, 1)
+        print(f"DeltaTest Impact Analysis (base: {args.base})")
+        print(f"  Changed files:  {len(changed)}")
+        print(f"  Affected tests: {len(affected)} / {total}")
+        print(f"  Skipped tests:  {skipped}")
+        print(f"  Reduction:      {reduction}%")
+        if affected:
+            print("\nAffected test files:")
+            for t in affected:
+                print(f"  \u2022 {t}")
 
 
 if __name__ == "__main__":
