@@ -6,7 +6,8 @@ setup(
     description="CI Test Impact Analysis Engine — only run tests affected by your changes",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    py_modules=["deltatest"],
+    py_modules=["deltatest", "deltatest_stats"],
+
     python_requires=">=3.8",
     entry_points={"console_scripts": ["deltatest=deltatest:main"]},
     classifiers=[

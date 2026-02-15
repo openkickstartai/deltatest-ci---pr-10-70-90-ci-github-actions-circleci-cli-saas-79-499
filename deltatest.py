@@ -6,6 +6,8 @@ import subprocess
 import json
 from pathlib import Path
 from collections import defaultdict
+from deltatest_stats import estimate_savings, format_savings_line
+
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".mypy_cache"}
 
