@@ -19,6 +19,35 @@ pytest $(deltatest --base main --pytest-args)
 deltatest --base main --json
 ```
 
+## 🔌 Pytest Plugin (Zero Config)
+
+After installing DeltaTest, the pytest plugin is automatically registered. No configuration needed:
+
+```bash
+# Run only tests affected by changes vs main branch
+pytest --only-affected
+
+# Diff against a different branch
+pytest --only-affected --diff-base=develop
+
+# Combine with any pytest options
+pytest --only-affected -v --tb=short -x
+```
+
+Output:
+```
+===== DeltaTest summary =====
+DeltaTest: running 12/340 tests (96% skipped)
+===== 12 passed in 3.21s =====
+```
+
+The plugin:
+- Adds `--only-affected` flag to enable impact filtering
+- Adds `--diff-base` option (default: `main`) to set the comparison branch
+- Automatically deselects unaffected tests at collection time
+- Prints a summary showing how many tests were skipped
+
+
 ## 🔧 GitHub Actions Integration
 
 ```yaml
